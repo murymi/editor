@@ -1,20 +1,18 @@
 const std = @import("std");
-const print = std.debug.print;
-const vec = std.ArrayList;
-const Allocator = std.mem.Allocator;
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const inc = @import("inc.zig");
+const vec = inc.vec;
+const Allocator = inc.Allocator;
+const gpa = inc.gpa;
+const println = inc.println;
 
-fn println (comptime fmt: []const u8, args: anytype) void {
-    print(fmt, args);
-    print("\n", .{});
-}
 
-const Editor = struct {
+pub const Editor = struct {
     rows: vec(Row),
     cursor_pos: Pos,
     allocator: Allocator,
+    filename: []const u8,
 
-    const Pos = struct {
+    pub const Pos = struct {
         row: usize,
         col: usize
     };
@@ -37,23 +35,24 @@ const Editor = struct {
 
     const Self = @This();
 
-    fn init(allocator: Allocator) Self {
+    pub fn init(allocator: Allocator) Self {
         return Self {
             .rows = vec(Row).init(allocator),
             .cursor_pos = .{ .col = 0, .row = 0 },
-            .allocator = allocator
+            .allocator = allocator,
+            .filename = ""
         };
     }
 
-    fn addchar(self: *Self, char: u8) !void {
+    pub fn addchar(self: *Self, char: u8) !void {
         const row = if(self.cursor_pos.row > self.rows.items.len or self.rows.items.len == 0) block: {
             try self.rows.appendNTimes(Row.init(self.allocator), (self.cursor_pos.row - self.rows.items.len) + 1);
             break: block &self.rows.items[self.cursor_pos.row];
         } else &self.rows.items[self.cursor_pos.row];
 
-        if(self.cursor_pos.col >= row.characters.items.len or row.characters.items.len == 0) {
-            try row.characters.appendNTimes(0, (self.cursor_pos.col - row.characters.items.len) + 1);
-        }
+        //if(self.cursor_pos.col >= row.characters.items.len or row.characters.items.len == 0) {
+        //    try row.characters.appendNTimes('z', (self.cursor_pos.col - row.characters.items.len) + 1);
+        //}
 
         switch (char) {
             '\n' => {
@@ -75,7 +74,7 @@ const Editor = struct {
         }
     }
 
-    fn delchar(self: *Self) !void {
+    pub fn delchar(self: *Self) !void {
         if(self.cursor_pos.row == 0 and self.cursor_pos.col == 0) return;
         if(self.cursor_pos.col == 0) {
             const cp = self.rows.items[self.cursor_pos.row - 1].characters.items.len - 1;
@@ -95,57 +94,89 @@ const Editor = struct {
         }
     }
 
-    fn addstring(self: *Self, string: []const u8) !void {
+    pub fn addstring(self: *Self, string: []const u8) !void {
         for(string) |c| {
             try self.addchar(c);
         }
     }
 
-    fn  tostring(self: *Self) !vec(u8) {
+    pub fn addfile(self: *Self, fname: []const u8) !void {
+        var file = std.fs.openFileAbsolute(fname, .{ .mode = .read_only }) catch |e| {
+            switch (e) {
+                std.fs.File.OpenError.FileNotFound => {
+                    const f = try std.fs.createFileAbsolute(fname, .{});
+                    f.close();
+                    return;
+                },
+                else => return e
+            }
+        };
+        const buf = try file.readToEndAlloc(self.allocator, std.math.maxInt(u16));
+        for(buf)|c| {
+            try self.addchar(c);
+        }
+        self.filename = fname;
+        defer file.close();
+    }
+
+    pub fn savefile(self: *Self) !void {
+        if(self.filename.len != 0) {
+            var file = try std.fs.createFileAbsolute(self.filename, .{.truncate = true });
+            try file.writeAll((try self.tostring()).items);
+            file.close();
+        }
+    }
+
+    pub fn  tostring(self: *Self) !vec(u8) {
         var s = vec(u8).init(self.allocator);
         for(self.rows.items)|row| {
             try s.appendSlice(row.characters.items);
+            try s.append('\n');
+        }
+        if(s.items.len > 0) {
+            //std.debug.assert(s.pop() == 0);
         }
         return s;
     }
 
-    fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self) void {
         for(self.rows.items) |*r| {
             r.deinit();
         }
         self.rows.deinit();
     }
 
-    fn forw(self: *Self) void {
-        if(self.rows.items[self.cursor_pos.row].characters.items.len > self.cursor_pos.col)
+    pub fn forw(self: *Self) void {
+        if(self.rows.items.len > 0 and self.rows.items[self.cursor_pos.row].characters.items.len > self.cursor_pos.col) {
             self.cursor_pos.col += 1;
+        }
     }
 
-    fn back(self: *Self) void {
+    pub fn back(self: *Self) void {
         if(self.cursor_pos.col > 0) 
             self.cursor_pos.col -= 1;
     }
 
-    fn up(self: *Self) void {
-        if(self.cursor_pos.row > 0) 
+    pub fn up(self: *Self) void {
+        if(self.cursor_pos.row > 0) {
             self.cursor_pos.row -= 1;
+            if(self.cursor_pos.col >= self.rows.items[self.cursor_pos.row].characters.items.len) {
+                self.cursor_pos.col = self.rows.items[self.cursor_pos.row].characters.items.len - 1;
+            }
+        }
     }
 
-    fn down(self: *Self) void {
-        if(self.rows.items.len > self.cursor_pos.row)
+    pub fn down(self: *Self) void {
+        if(self.rows.items.len > self.cursor_pos.row + 1) {
             self.cursor_pos.row += 1;
+            if(self.cursor_pos.col >= self.rows.items[self.cursor_pos.row].characters.items.len) {
+                self.cursor_pos.col = if(self.rows.items[self.cursor_pos.row].characters.items.len > 0)
+                    self.rows.items[self.cursor_pos.row].characters.items.len else 0;
+            }
+        }
+
     }
 };
-
-pub fn main() !void {
-    //println("Hello world", .{});
-    const allocator = gpa.allocator();
-
-    const editor = Editor.init(allocator);
-    _ = editor;
-
-
-}
 
 test "editor" {
     const testing = std.testing;
