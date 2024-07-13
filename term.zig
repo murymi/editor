@@ -8,7 +8,7 @@ const print = inc.print;
 const os = inc.os;
 const ed = @import("editor.zig");
 
-const TermError = error{ TcGetAttr, TcSetAttr };
+const TermError = error{ TcGetAttr, TcSetAttr, Winch };
 
 const Terminal = struct {
     termios: os.termios,
@@ -163,19 +163,49 @@ const Monitor = struct {
         self.buffer.clearAndFree();
     }
 
-    fn getWindowSize(_: *Self) ed.Editor.Pos {
+    fn getCursorPos(self: *Self) !ed.Editor.Pos {
+        std.debug.assert(try self.writer.write("\x1b[6n") == 4);
+        var buf = [1]u8{0} ** 10;
+        var r: usize = 0;
+        var i:usize = 0;
+        while(true){
+            const n = try self.reader.read(buf[i..i+1]);
+            if(n == 0) continue;
+            std.debug.assert(n == 1);
+            if(buf[i..][0] == 'R') break;
+            r += n;
+            i += 1;
+        }
+        if(buf[0] != 27 or buf[1] != '[') return error.Winch;
+        var iter = std.mem.splitAny(u8, buf[2..r], ";");
+        return .{
+            .row = try std.fmt.parseInt(usize, iter.next().?, 10),
+            .col = try std.fmt.parseInt(usize, iter.next().?, 10)
+        };
+    }
+
+    fn getWindowSize(self: *Self) !ed.Editor.Pos {
         const ws = std.mem.zeroes(os.winsize);
         switch (os.getErrno(os.ioctl(os.STDOUT_FILENO, 0x5413, @intFromPtr(&ws)))) {
             .SUCCESS => {
-                if (ws.ws_col == 0) {}
+                if (ws.ws_col == 0) {
+                    const curpos = try self.getCursorPos();
+                    try self.goto(.{ .row = 999 , .col = 999 });
+                    try self.flush();
+                    const p = try self.getCursorPos();
+                    try self.goto(curpos);
+                    try self.flush();
+                    return p;
+                } else {
+                    return ed.Editor.Pos{ .col = ws.ws_col, .row = ws.ws_row };
+                }
             },
             else => @panic("ioctl failed"),
         }
-        return ed.Editor.Pos{ .col = ws.ws_col, .row = ws.ws_row };
     }
 
     fn refresh(self: *Self) !void {
-        _ = self.getWindowSize();
+        _ = try self.getWindowSize();
         try self.hidecursor();
         try self.home();
         try self.clear();
@@ -238,7 +268,9 @@ var monitor: Monitor = undefined;
 var editor: ed.Editor = undefined;
 
 export fn sigwinchHandler(_: c_int) void {
-    monitor.refresh() catch {};
+    monitor.refresh() catch {
+        os.exit(1);
+    };
 }
 
 pub fn main() !void {
