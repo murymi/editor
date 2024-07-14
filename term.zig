@@ -318,7 +318,6 @@ pub fn main() !void {
         }
     };
 
-
     const allocator = gpa.allocator();
     var term = try Terminal.init(0);
     try term.raw();
@@ -344,6 +343,9 @@ pub fn main() !void {
                 enter => try editor.addchar('\n'),
                 backspace => try editor.delchar(),
                 ctrls => try editor.savefile(),
+                tab => {
+                    try editor.addstring("  ");
+                },
                 else => |c| try editor.addchar(c),
             },
         }
