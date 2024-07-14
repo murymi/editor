@@ -7,6 +7,9 @@ const println = inc.println;
 const print = inc.print;
 const os = inc.os;
 const ed = @import("editor.zig");
+const atomic = std.atomic;
+const builtin = std.builtin;
+const Pos = ed.Editor.Pos;
 
 const TermError = error{ TcGetAttr, TcSetAttr, Winch };
 
@@ -101,6 +104,7 @@ const Monitor = struct {
     reader: std.io.AnyReader,
     writer: std.io.AnyWriter,
     buffer: vec(u8),
+    ws: ed.Editor.Pos,
 
     const IOError = error{ ReadError, WriteError };
 
@@ -125,11 +129,12 @@ const Monitor = struct {
     };
 
     const Self = @This();
-    fn init(alloc: Allocator) Self {
+    fn init(alloc: Allocator) !Self {
         var m: Self = undefined;
         m.reader = .{ .context = @as(*anyopaque, @ptrFromInt(0xfefe)), .readFn = @as(*const fn (*const anyopaque, []u8) anyerror!usize, @ptrCast(&ReadWriter.read)) };
         m.writer = .{ .context = @as(*anyopaque, @ptrFromInt(0xfefe)), .writeFn = @as(*const fn (*const anyopaque, []const u8) anyerror!usize, @ptrCast(&ReadWriter.write)) };
         m.buffer = vec(u8).init(alloc);
+        try m.updateWindowSize();
         return m;
     }
 
@@ -167,58 +172,68 @@ const Monitor = struct {
         std.debug.assert(try self.writer.write("\x1b[6n") == 4);
         var buf = [1]u8{0} ** 10;
         var r: usize = 0;
-        var i:usize = 0;
-        while(true){
-            const n = try self.reader.read(buf[i..i+1]);
-            if(n == 0) continue;
+        var i: usize = 0;
+        while (true) {
+            const n = try self.reader.read(buf[i .. i + 1]);
+            if (n == 0) continue;
             std.debug.assert(n == 1);
-            if(buf[i..][0] == 'R') break;
+            if (buf[i..][0] == 'R') break;
             r += n;
             i += 1;
         }
-        if(buf[0] != 27 or buf[1] != '[') return error.Winch;
+        if (buf[0] != 27 or buf[1] != '[') return error.Winch;
+        //println("{s}", .{buf});
+        //std.time.sleep(std.time.ns_per_s * 5);
         var iter = std.mem.splitAny(u8, buf[2..r], ";");
-        return .{
-            .row = try std.fmt.parseInt(usize, iter.next().?, 10),
-            .col = try std.fmt.parseInt(usize, iter.next().?, 10)
-        };
+        return .{ .row = try std.fmt.parseInt(usize, iter.next().?, 10), .col = try std.fmt.parseInt(usize, iter.next().?, 10) };
     }
 
-    fn getWindowSize(self: *Self) !ed.Editor.Pos {
+    fn updateWindowSize(self: *Self) !void {
         const ws = std.mem.zeroes(os.winsize);
         switch (os.getErrno(os.ioctl(os.STDOUT_FILENO, 0x5413, @intFromPtr(&ws)))) {
             .SUCCESS => {
                 if (ws.ws_col == 0) {
                     const curpos = try self.getCursorPos();
-                    try self.goto(.{ .row = 999 , .col = 999 });
+                    try self.goto(.{ .row = 999, .col = 999 });
                     try self.flush();
                     const p = try self.getCursorPos();
                     try self.goto(curpos);
                     try self.flush();
-                    return p;
+                    self.ws = p;
                 } else {
-                    return ed.Editor.Pos{ .col = ws.ws_col, .row = ws.ws_row };
+                    self.ws = ed.Editor.Pos{ .col = ws.ws_col, .row = ws.ws_row };
                 }
             },
-            else => @panic("ioctl failed"),
+            else => {
+                const curpos = try self.getCursorPos();
+                try self.goto(.{ .row = 999, .col = 999 });
+                try self.flush();
+                const p = try self.getCursorPos();
+                try self.goto(curpos);
+                try self.flush();
+                self.ws = p;
+            },
         }
     }
 
-    fn refresh(self: *Self) !void {
-        _ = try self.getWindowSize();
+    fn refresh(self: *Self, edi: *ed.Editor) !void {
+        //const ws = try self.getWindowSize();
+        const pos = ed.Editor.Pos{ .row = edi.cursor_pos.row + 1, .col = edi.cursor_pos.col + 1 };
         try self.hidecursor();
         try self.home();
         try self.clear();
         for (editor.rows.items) |row| {
-            if (row.characters.items.len > 0) {
-                try monitor.write(row.characters.items[0 .. row.characters.items.len - 1]);
-                if (row.characters.items[row.characters.items.len - 1] != '\n') {
-                    try monitor.write(row.characters.items[row.characters.items.len - 1 ..]);
-                }
+            const rowsize = row.characters.items.len;
+            const ub = @min(if (rowsize > 0) rowsize - 1 else 0, self.ws.col - 1);
+            if (ub == self.ws.col - 1) {
+                try monitor.write(row.characters.items[0..ub]);
+                try monitor.write(">");
+            } else {
+                try monitor.write(row.characters.items[0..rowsize]);
             }
+
             try monitor.write("\r\n");
         }
-        const pos = ed.Editor.Pos{ .row = editor.cursor_pos.row + 1, .col = editor.cursor_pos.col + 1 };
         try self.goto(pos);
         try self.showcursor();
         try self.flush();
@@ -268,25 +283,56 @@ var monitor: Monitor = undefined;
 var editor: ed.Editor = undefined;
 
 export fn sigwinchHandler(_: c_int) void {
-    monitor.refresh() catch {
+    monitor.updateWindowSize() catch {
+        os.exit(1);
+    };
+    monitor.refresh(&editor) catch {
         os.exit(1);
     };
 }
 
 pub fn main() !void {
+    const cwd = std.fs.cwd();
+    const args = std.os.argv;
+
+    if (args.len != 2) {
+        println("usage: {s} <file>", .{args[0]});
+        os.exit(1);
+    }
+
+    var filename:[]const u8 = undefined;
+    filename.ptr = @ptrCast(args[1]);
+    filename.len = 0;
+    while(true) {
+        if(args[1][filename.len] == 0) break;
+        filename.len += 1;
+    }
+
+    const file = if (cwd.openFile(filename, .{ .mode = .read_write })) |f| f else |e| block: {
+        switch (e) {
+            std.fs.File.OpenError.FileNotFound => break :block try cwd.createFile(filename, .{ .truncate = true }),
+            else => {
+                println("failed to open file: {s}", .{args[1]});
+                os.exit(1);
+            },
+        }
+    };
+
+
     const allocator = gpa.allocator();
     var term = try Terminal.init(0);
     try term.raw();
     defer term.cook() catch {};
     editor = ed.Editor.init(allocator);
+    try editor.addfile(file, filename);
 
-    monitor = Monitor.init(allocator);
+    monitor = try Monitor.init(allocator);
     var act = std.mem.zeroes(os.Sigaction);
     act.handler = .{ .handler = sigwinchHandler };
     _ = os.sigaction(os.SIG.WINCH, &act, null);
 
     for (0..1000) |_| {
-        try monitor.refresh();
+        try monitor.refresh(&editor);
         const event = try monitor.poll();
         switch (event.kind) {
             .keyevent => |ke| switch (ke.key) {
@@ -297,6 +343,7 @@ pub fn main() !void {
                 right => editor.forw(),
                 enter => try editor.addchar('\n'),
                 backspace => try editor.delchar(),
+                ctrls => try editor.savefile(),
                 else => |c| try editor.addchar(c),
             },
         }
